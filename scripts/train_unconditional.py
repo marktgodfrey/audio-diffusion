@@ -7,7 +7,7 @@ from typing import Optional
 
 from accelerate import Accelerator
 from accelerate.logging import get_logger
-from datasets import load_from_disk, load_dataset
+from datasets import load_from_disk, load_dataset, concatenate_datasets
 from diffusers import (
     AudioDiffusionPipeline,
     DDPMScheduler,
@@ -20,15 +20,17 @@ from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from huggingface_hub import HfFolder, Repository, whoami
 from librosa.util import normalize
-import numpy as np
+# import numpy as np
 import torch
 import torch.nn.functional as F
-from torchvision.transforms import (
-    Compose,
-    Normalize,
-    ToTensor,
-)
+# from torchvision.transforms import (
+#     Compose,
+#     Normalize,
+#     ToTensor,
+# )
 from tqdm.auto import tqdm
+import librosa
+
 
 logger = get_logger(__name__)
 
@@ -56,9 +58,23 @@ def main(args):
     )
 
     if args.dataset_name is not None:
-        if os.path.exists(args.dataset_name):
-            dataset = load_from_disk(args.dataset_name,
-                                     args.dataset_config_name)["train"]
+        if os.path.exists(os.path.join(args.dataset_name, '0')):
+            # sharded so let's combine them all
+            shard_count = 0
+            dataset = None
+            while True:
+                dataset_path = os.path.join(args.dataset_name, '%d' % shard_count)
+                if not os.path.exists(dataset_path):
+                    break
+                dataset_shard = load_from_disk(dataset_path, args.dataset_config_name)["train"]
+                if dataset is None:
+                    dataset = dataset_shard
+                else:
+                    dataset = concatenate_datasets([dataset, dataset_shard])
+                shard_count += 1
+            dataset = dataset.with_format("torch")
+        elif os.path.exists(args.dataset_name):
+            dataset = load_from_disk(args.dataset_name, args.dataset_config_name)["train"].with_format("torch")
         else:
             dataset = load_dataset(
                 args.dataset_name,
@@ -74,25 +90,30 @@ def main(args):
             cache_dir=args.cache_dir,
             split="train",
         )
+
+    print('loaded dataset with %d samples' % len(dataset))
+
     # Determine image resolution
-    resolution = dataset[0]["image"].height, dataset[0]["image"].width
+    # resolution = dataset[0]["image"].height, dataset[0]["image"].width
+    resolution = dataset[0]["melspec"].shape
 
-    augmentations = Compose([
-        ToTensor(),
-        Normalize([0.5], [0.5]),
-    ])
+    # augmentations = Compose([
+    #     ToTensor(),
+    #     Normalize([0.5], [0.5]),
+    # ])
+    #
+    # def transforms(examples):
+    #     if args.vae is not None and vqvae.config["in_channels"] == 3:
+    #         images = [
+    #             augmentations(image.convert("RGB"))
+    #             for image in examples["image"]
+    #         ]
+    #     else:
+    #         images = [augmentations(image) for image in examples["image"]]
+    #     return {"input": images}
+    #
+    # dataset.set_transform(transforms)
 
-    def transforms(examples):
-        if args.vae is not None and vqvae.config["in_channels"] == 3:
-            images = [
-                augmentations(image.convert("RGB"))
-                for image in examples["image"]
-            ]
-        else:
-            images = [augmentations(image) for image in examples["image"]]
-        return {"input": images}
-
-    dataset.set_transform(transforms)
     train_dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=args.train_batch_size, shuffle=True)
 
@@ -110,7 +131,7 @@ def main(args):
 
     if args.from_pretrained is not None:
         pipeline = AudioDiffusionPipeline.from_pretrained(args.from_pretrained)
-        mel = pipeline.mel
+        # mel = pipeline.mel
         model = pipeline.unet
         if hasattr(pipeline, "vqvae"):
             vqvae = pipeline.vqvae
@@ -196,6 +217,9 @@ def main(args):
 
     global_step = 0
     for epoch in range(args.num_epochs):
+
+        torch.cuda.empty_cache()
+
         progress_bar = tqdm(total=len(train_dataloader),
                             disable=not accelerator.is_local_main_process)
         progress_bar.set_description(f"Epoch {epoch}")
@@ -212,7 +236,13 @@ def main(args):
 
         model.train()
         for step, batch in enumerate(train_dataloader):
-            clean_images = batch["input"]
+            # clean_images = batch["input"]
+            clean_images = (batch['melspec'] - 0.5) * 2.
+            clean_images = clean_images.unsqueeze(1)
+
+            # if accelerator.is_main_process:
+            #     accelerator.trackers[0].writer.add_images(
+            #         "train_samples", (clean_images / 2. + 0.5), global_step)
 
             if vqvae is not None:
                 vqvae.to(clean_images.device)
@@ -235,14 +265,23 @@ def main(args):
 
             # Add noise to the clean images according to the noise magnitude at each timestep
             # (this is the forward diffusion process)
-            noisy_images = noise_scheduler.add_noise(clean_images, noise,
+            noisy_images = noise_scheduler.add_noise(clean_images,
+                                                     noise,
                                                      timesteps)
 
             with accelerator.accumulate(model):
                 # Predict the noise residual
-                noise_pred = model(noisy_images, timesteps)["sample"]
+                output = model(noisy_images, timesteps)
+                noise_pred = output["sample"]
                 loss = F.mse_loss(noise_pred, noise)
                 accelerator.backward(loss)
+
+                # if accelerator.is_main_process:
+                #     images = noise_scheduler.step(model_output=noise_pred, timestep=timesteps[-1], sample=noisy_images)["prev_sample"]
+                #     images = (images / 2. + 0.5).clamp(0., 1.).detach().cpu().numpy()
+                #     print(images.shape)
+                #     accelerator.trackers[0].writer.add_images(
+                #         "train_output", images, global_step)
 
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(model.parameters(), 1.0)
@@ -251,6 +290,25 @@ def main(args):
                 if args.use_ema:
                     ema_model.step(model)
                 optimizer.zero_grad()
+
+                # if accelerator.is_main_process:
+                #     with torch.no_grad():
+                #         generator = torch.Generator(device=clean_images.device)
+                #         scheduler = DDIMScheduler()
+                #         scheduler.set_timesteps(50)
+                #         init = torch.randn((4, 1, resolution[0], resolution[1]),
+                #                            generator=generator,
+                #                            device=clean_images.device)
+                #         images = init
+                #         unwrapped_model = accelerator.unwrap_model(model)
+                #         for t in scheduler.timesteps:
+                #             noise_pred = unwrapped_model(images, t)["sample"]
+                #             images = scheduler.step(model_output=noise_pred, timestep=t, sample=images,
+                #                                     generator=generator, eta=0.)["prev_sample"]
+                #         images = (images / 2. + 0.5).clamp(0., 1.).detach().cpu().numpy()
+                #         print(images.shape)
+                #         accelerator.trackers[0].writer.add_images(
+                #             "train_output", images, global_step)
 
             progress_bar.update(1)
             global_step += 1
@@ -270,9 +328,7 @@ def main(args):
 
         # Generate sample images for visual inspection
         if accelerator.is_main_process:
-            if (epoch + 1) % args.save_model_epochs == 0 or (
-                    epoch + 1
-            ) % args.save_images_epochs == 0 or epoch == args.num_epochs - 1:
+            if (epoch + 1) % args.save_model_epochs == 0 or epoch == args.num_epochs - 1:
                 pipeline = AudioDiffusionPipeline(
                     vqvae=vqvae,
                     unet=accelerator.unwrap_model(
@@ -281,42 +337,69 @@ def main(args):
                     scheduler=noise_scheduler,
                 )
 
-            if (
-                    epoch + 1
-            ) % args.save_model_epochs == 0 or epoch == args.num_epochs - 1:
                 pipeline.save_pretrained(output_dir)
 
-                # save the model
                 if args.push_to_hub:
                     repo.push_to_hub(commit_message=f"Epoch {epoch}",
                                      blocking=False,
                                      auto_lfs_prune=True)
 
             if (epoch + 1) % args.save_images_epochs == 0:
-                generator = torch.Generator(
-                    device=clean_images.device).manual_seed(42)
-                # run pipeline in inference (sample random noise and denoise)
-                images, (sample_rate,
-                         audios) = pipeline(generator=generator,
-                                            batch_size=args.eval_batch_size,
-                                            return_dict=False)
+                # generator = torch.Generator(
+                #     device=clean_images.device).manual_seed(42)
+                # # run pipeline in inference (sample random noise and denoise)
+                # images, (sample_rate,
+                #          audios) = pipeline(generator=generator,
+                #                             batch_size=args.eval_batch_size,
+                #                             return_dict=False)
+                #
+                # # denormalize the images and save to tensorboard
+                # images = np.array([
+                #     np.frombuffer(image.tobytes(), dtype="uint8").reshape(
+                #         (len(image.getbands()), image.height, image.width))
+                #     for image in images
+                # ])
+                # accelerator.trackers[0].writer.add_images(
+                #     "test_samples", images, epoch)
+                # for _, audio in enumerate(audios):
+                #     accelerator.trackers[0].writer.add_audio(
+                #         f"test_audio_{_}",
+                #         normalize(audio),
+                #         epoch,
+                #         sample_rate=sample_rate,
+                #     )
 
-                # denormalize the images and save to tensorboard
-                images = np.array([
-                    np.frombuffer(image.tobytes(), dtype="uint8").reshape(
-                        (len(image.getbands()), image.height, image.width))
-                    for image in images
-                ])
-                accelerator.trackers[0].writer.add_images(
-                    "test_samples", images, epoch)
-                for _, audio in enumerate(audios):
-                    accelerator.trackers[0].writer.add_audio(
-                        f"test_audio_{_}",
-                        normalize(audio),
-                        epoch,
-                        sample_rate=sample_rate,
-                    )
-        accelerator.wait_for_everyone()
+                with torch.no_grad():
+                    generator = torch.Generator(device=clean_images.device).manual_seed(42)
+                    scheduler = DDIMScheduler()
+                    scheduler.set_timesteps(50)
+                    init = torch.randn((args.eval_batch_size, 1, resolution[0], resolution[1]),
+                                       generator=generator,
+                                       device=clean_images.device)
+                    images = init
+                    unwrapped_model = accelerator.unwrap_model(model)
+                    for t in scheduler.timesteps:
+                        noise_pred = unwrapped_model(images, t)["sample"]
+                        images = scheduler.step(model_output=noise_pred, timestep=t, sample=images,
+                                                generator=generator, eta=0.)["prev_sample"]
+                    images = (images / 2. + 0.5).clamp(0., 1.).detach().cpu().numpy()
+                    accelerator.trackers[0].writer.add_images(
+                        "test_samples", images, global_step)
+                    for i, image in enumerate(images):
+                        log_S = librosa.db_to_power(image * mel.top_db - mel.top_db)
+                        audio = librosa.feature.inverse.mel_to_audio(log_S,
+                                                                     sr=mel.sr,
+                                                                     n_fft=mel.n_fft,
+                                                                     hop_length=mel.hop_length,
+                                                                     n_iter=mel.n_iter)
+                        accelerator.trackers[0].writer.add_audio(
+                            f"test_audio_{i}",
+                            normalize(audio, axis=1),
+                            epoch,
+                            sample_rate=mel.sample_rate,
+                        )
+
+    accelerator.wait_for_everyone()
 
     accelerator.end_training()
 
