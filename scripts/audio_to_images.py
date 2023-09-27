@@ -1,6 +1,7 @@
 import os
 import re
-import io
+# import io
+import json
 import logging
 import argparse
 
@@ -26,11 +27,19 @@ def main(args):
               n_fft=args.n_fft)
     audio_files = [
         os.path.join(root, file) for root, _, files in os.walk(args.input_dir)
-        for file in files if re.search(r"\.(mp3|wav|m4a)$", file, re.IGNORECASE)
+        for file in files if re.search(r"\.(mp3|wav|m4a|opus)$", file, re.IGNORECASE)
     ]
+    if os.path.exists(args.metadata_path):
+        with open(args.metadata_path, 'r') as metadata_file:
+            metadata = json.load(metadata_file)
+    else:
+        print('missing metadata?! %s' % args.metadata_path)
     shard_count = 0
     examples = []
     for audio_file in tqdm(audio_files):
+        if os.path.basename(audio_file) not in metadata:
+            continue
+        example_metadata = metadata[os.path.basename(audio_file)]
         try:
             mel.load_audio(audio_file)
         except KeyboardInterrupt:
@@ -39,20 +48,29 @@ def main(args):
             continue
         for slice in range(mel.get_number_of_slices()):
             y = mel.get_audio_slice(slice)
-            melspec = librosa.feature.melspectrogram(
-                y=y,
-                sr=mel.sr,
-                n_fft=mel.n_fft,
-                hop_length=mel.hop_length,
-                n_mels=mel.n_mels
-            )
-            melspec_db = librosa.power_to_db(melspec, ref=np.max, top_db=mel.top_db)
-            melspec_db_norm = ((melspec_db + mel.top_db) / mel.top_db).clip(0., 1.)
-            examples.append({
-                "melspec": melspec_db_norm.tolist(),
+            if args.linear:
+                spec = np.abs(librosa.stft(y=y,
+                                           n_fft=(mel.y_res * 2),
+                                           hop_length=mel.hop_length)) ** 2.0
+                spec = spec[1:, :]  # remove DC
+            else:
+                spec = librosa.feature.melspectrogram(
+                    y=y,
+                    sr=mel.sr,
+                    n_fft=mel.n_fft,
+                    hop_length=mel.hop_length,
+                    n_mels=mel.n_mels
+                )
+            spec_db = librosa.power_to_db(spec, ref=np.max, top_db=mel.top_db)
+            spec_db_norm = ((spec_db + mel.top_db) / mel.top_db).clip(0., 1.)
+            example = {
+                # "audio": np.expand_dims(y, axis=0).tolist(),
+                "spec": spec_db_norm.tolist(),
                 "audio_file": audio_file,
                 "slice": slice,
-            })
+            }
+            example.update(example_metadata)
+            examples.append(example)
 
             # image = mel.audio_slice_to_image(slice)
             # assert (image.width == args.resolution[0] and image.height
@@ -85,10 +103,11 @@ def main(args):
             ds = Dataset.from_list(
                 examples,
                 features=Features({
-                    # "image": Image(),
-                    "melspec": Array2D(shape=(args.resolution[1], args.resolution[0]), dtype='float32'),
+                    # "audio": Array2D(shape=(1, (args.resolution[0] * args.hop_length - 1)), dtype='float32'),
+                    "spec": Array2D(shape=(args.resolution[1], args.resolution[0]), dtype='float32'),
                     "audio_file": Value(dtype="string"),
                     "slice": Value(dtype="int16"),
+                    "artist": Value(dtype="string")
                 }),
             )
             dsd = DatasetDict({"train": ds})
@@ -105,10 +124,11 @@ def main(args):
         ds = Dataset.from_list(
             examples,
             features=Features({
-                # "image": Image(),
-                "melspec": Array2D(shape=(args.resolution[1], args.resolution[0]), dtype='float32'),
+                # "audio": Array2D(shape=(1, (args.resolution[0] * args.hop_length - 1)), dtype='float32'),
+                "spec": Array2D(shape=(args.resolution[1], args.resolution[0]), dtype='float32'),
                 "audio_file": Value(dtype="string"),
                 "slice": Value(dtype="int16"),
+                "artist": Value(dtype="string")
             }),
         )
         dsd = DatasetDict({"train": ds})
@@ -120,13 +140,13 @@ def main(args):
         print('saved: %s' % out_path)
 
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description=
         "Create dataset of Mel spectrograms from directory of audio files.")
     parser.add_argument("--input_dir", type=str)
     parser.add_argument("--output_dir", type=str, default="data")
+    parser.add_argument("--metadata_path", type=str)
     parser.add_argument("--resolution",
                         type=str,
                         default="256",
@@ -135,6 +155,7 @@ if __name__ == "__main__":
     parser.add_argument("--push_to_hub", type=str, default=None)
     parser.add_argument("--sample_rate", type=int, default=22050)
     parser.add_argument("--n_fft", type=int, default=2048)
+    parser.add_argument('--linear', action='store_true', default=False)
     args = parser.parse_args()
 
     if args.input_dir is None:

@@ -2,6 +2,7 @@
 
 import argparse
 import os
+import random
 from pathlib import Path
 from typing import Optional
 
@@ -11,7 +12,7 @@ from datasets import load_from_disk, load_dataset, concatenate_datasets
 from diffusers import (
     AudioDiffusionPipeline,
     DDPMScheduler,
-    UNet2DModel,
+    UNet2DConditionModel,
     DDIMScheduler,
     AutoencoderKL,
 )
@@ -85,6 +86,20 @@ def multimel_loss(x_in, x_out,
     return torch.mean(sum(losses) / len(losses))
 
 
+def encoding_from_batch(metadata, labels):
+    dim = len(labels)
+    return torch.tensor([[1. if a == labels[i] else 0. for a in metadata]
+                         for i in range(dim)]).transpose(0, 1).view(-1, 1, dim)
+
+
+def encoding_for_sampling(batch_size, dim=1):
+    if dim == 1:
+        return torch.tensor(int(args.eval_batch_size/2)*[0.] + int(args.eval_batch_size/2)*[1.]).view(-1, 1, 1)
+    if dim > 1:
+        return torch.eye(dim).repeat(int(batch_size/dim)+1, 1)[:batch_size].view(-1, 1, dim)
+    return None
+
+
 def get_full_repo_name(model_id: str,
                        organization: Optional[str] = None,
                        token: Optional[str] = None):
@@ -146,8 +161,13 @@ def main(args):
     # Determine image resolution
     # resolution = dataset[0]["image"].height, dataset[0]["image"].width
     resolution = dataset[0]["spec"].shape
-
     # print(resolution)
+
+    encoding_dim = len(args.cond_labels)
+    if args.uncond:
+        print('unconditional training!')
+    else:
+        print('labels for conditioning: %s' % args.cond_labels)
 
     vocoder = GomiGAN.from_pretrained(pretrained_model_path="/workspace/code/audio-diffusion/gomin/models/gan_state_dict.pt", **GANConfig().__dict__).to('cuda')
     for p in vocoder.parameters():
@@ -192,7 +212,7 @@ def main(args):
         if hasattr(pipeline, "vqvae"):
             vqvae = pipeline.vqvae
     else:
-        model = UNet2DModel(
+        model = UNet2DConditionModel(
             sample_size=resolution if vqvae is None else latent_resolution,
             in_channels=1
             if vqvae is None else vqvae.config["latent_channels"],
@@ -205,25 +225,28 @@ def main(args):
                 "DownBlock2D",
                 "DownBlock2D",
                 "DownBlock2D",
-                "AttnDownBlock2D",
+                "CrossAttnDownBlock2D",
                 "DownBlock2D",
             ),
             up_block_types=(
                 "UpBlock2D",
-                "AttnUpBlock2D",
+                "CrossAttnUpBlock2D",
                 "UpBlock2D",
                 "UpBlock2D",
                 "UpBlock2D",
                 "UpBlock2D",
             ),
+            cross_attention_dim=encoding_dim,
         )
 
     if args.scheduler == "ddpm":
         noise_scheduler = DDPMScheduler(
-            num_train_timesteps=args.num_train_steps)
+            num_train_timesteps=args.num_train_steps,
+            beta_schedule=args.beta_schedule)
     else:
         noise_scheduler = DDIMScheduler(
-            num_train_timesteps=args.num_train_steps)
+            num_train_timesteps=args.num_train_steps,
+            beta_schedule=args.beta_schedule)
     noise_scheduler.set_timesteps(args.num_train_steps)
 
     optimizer = torch.optim.AdamW(
@@ -249,7 +272,7 @@ def main(args):
         getattr(model, "module", model),
         inv_gamma=args.ema_inv_gamma,
         power=args.ema_power,
-        max_value=args.ema_max_decay,
+        decay=args.ema_max_decay,
     )
 
     if args.push_to_hub:
@@ -298,6 +321,15 @@ def main(args):
             clean_images = (batch['spec'] - 0.5) * 2.
             clean_images = clean_images.unsqueeze(1)
 
+            if args.uncond:
+                encoding = torch.zeros(clean_images.size(0), 1, encoding_dim).to(clean_images.device)
+            else:
+                encoding = encoding_from_batch(batch[args.cond_key], args.cond_labels).to(clean_images.device)
+                if args.cond_dropout > 0.:
+                    d = torch.bernoulli(torch.tensor([(1. - args.cond_dropout)] * clean_images.size(0)))
+                    d = d.repeat_interleave(encoding_dim).view(-1, 1, encoding_dim).to(clean_images.device)
+                    encoding *= d
+
             # if accelerator.is_main_process:
             #     accelerator.trackers[0].writer.add_images(
             #         "train_samples", (clean_images / 2. + 0.5), global_step)
@@ -316,7 +348,7 @@ def main(args):
             # Sample a random timestep for each image
             timesteps = torch.randint(
                 0,
-                noise_scheduler.num_train_timesteps,
+                noise_scheduler.config.num_train_timesteps,
                 (bsz, ),
                 device=clean_images.device,
             ).long()
@@ -329,7 +361,7 @@ def main(args):
 
             with accelerator.accumulate(model):
                 # Predict the noise residual
-                output = model(noisy_images, timesteps)
+                output = model(noisy_images, timesteps, encoding)
                 noise_pred = output["sample"]
 
                 # loss = F.mse_loss(noise_pred, noise)
@@ -425,15 +457,19 @@ def main(args):
 
                     with torch.no_grad():
                         generator = torch.Generator(device=clean_images.device).manual_seed(42)
-                        scheduler = DDIMScheduler()
+                        scheduler = DDIMScheduler(beta_schedule=args.beta_schedule)
                         scheduler.set_timesteps(50)
                         init = torch.randn((args.eval_batch_size, 1, resolution[0], resolution[1]),
                                            generator=generator,
                                            device=clean_images.device)
+                        if args.uncond:
+                            encoding = torch.zeros(args.eval_batch_size, 1, encoding_dim).to(clean_images.device)
+                        else:
+                            encoding = encoding_for_sampling(args.eval_batch_size, dim=encoding_dim).to(clean_images.device)
                         images = init
                         unwrapped_model = accelerator.unwrap_model(model)
                         for t in scheduler.timesteps:
-                            noise_pred = unwrapped_model(images, t)["sample"]
+                            noise_pred = unwrapped_model(images, t, encoding)["sample"]
                             images = scheduler.step(model_output=noise_pred, timestep=t, sample=images,
                                                     generator=generator, eta=0.)["prev_sample"]
                         images = (images / 2. + 0.5).clamp(0., 1.).detach()
@@ -447,12 +483,20 @@ def main(args):
                             #                            win_length=mel.n_fft,
                             #                            hop_length=mel.hop_length)
                             audio = vocoder(image).detach().squeeze().cpu().numpy()
-                            accelerator.trackers[0].writer.add_audio(
-                                f"best_audio_{i}",
-                                normalize(audio),
-                                global_step,
-                                sample_rate=mel.sample_rate
-                            )
+                            if args.uncond:
+                                accelerator.trackers[0].writer.add_audio(
+                                    f"best_audio_{i}",
+                                    normalize(audio),
+                                    global_step,
+                                    sample_rate=args.sample_rate
+                                )
+                            else:
+                                accelerator.trackers[0].writer.add_audio(
+                                    f"best_audio_{i}_{args.cond_labels[i % len(args.cond_labels)]}",
+                                    normalize(audio),
+                                    global_step,
+                                    sample_rate=args.sample_rate
+                                )
 
         progress_bar.close()
 
@@ -505,15 +549,20 @@ def main(args):
 
                 with torch.no_grad():
                     generator = torch.Generator(device=clean_images.device).manual_seed(42)
-                    scheduler = DDIMScheduler()
+                    scheduler = DDIMScheduler(beta_schedule=args.beta_schedule)
                     scheduler.set_timesteps(50)
                     init = torch.randn((args.eval_batch_size, 1, resolution[0], resolution[1]),
                                        generator=generator,
                                        device=clean_images.device)
+                    if args.uncond:
+                        encoding = torch.zeros(args.eval_batch_size, 1, encoding_dim).to(clean_images.device)
+                    else:
+                        random.seed(42)
+                        encoding = encoding_for_sampling(args.eval_batch_size, dim=encoding_dim).to(clean_images.device)
                     images = init
                     unwrapped_model = accelerator.unwrap_model(model)
                     for t in scheduler.timesteps:
-                        noise_pred = unwrapped_model(images, t)["sample"]
+                        noise_pred = unwrapped_model(images, t, encoding)["sample"]
                         images = scheduler.step(model_output=noise_pred, timestep=t, sample=images,
                                                 generator=generator, eta=0.)["prev_sample"]
                     images = (images / 2. + 0.5).clamp(0., 1.).detach()
@@ -537,12 +586,20 @@ def main(args):
                         #                            hop_length=mel.hop_length)
 
                         audio = vocoder(image).detach().squeeze().cpu().numpy()
-                        accelerator.trackers[0].writer.add_audio(
-                            f"test_audio_{i}",
-                            normalize(audio),
-                            epoch,
-                            sample_rate=mel.sample_rate,
-                        )
+                        if args.uncond:
+                            accelerator.trackers[0].writer.add_audio(
+                                f"test_audio_{i}",
+                                normalize(audio),
+                                epoch,
+                                sample_rate=args.sample_rate,
+                            )
+                        else:
+                            accelerator.trackers[0].writer.add_audio(
+                                f"test_audio_{i}_{args.cond_labels[i % len(args.cond_labels)]}",
+                                normalize(audio),
+                                epoch,
+                                sample_rate=args.sample_rate,
+                            )
 
     accelerator.wait_for_everyone()
 
@@ -603,16 +660,18 @@ if __name__ == "__main__":
     parser.add_argument("--from_pretrained", type=str, default=None)
     parser.add_argument("--start_epoch", type=int, default=0)
     parser.add_argument("--num_train_steps", type=int, default=1000)
-    parser.add_argument("--scheduler",
-                        type=str,
-                        default="ddpm",
-                        help="ddpm or ddim")
+    parser.add_argument("--scheduler", type=str, default="ddpm", help="ddpm or ddim")
+    parser.add_argument("--beta_schedule", type=str, default="linear", help="linear, scaled_linear, or squaredcos_cap_v2")
     parser.add_argument(
         "--vae",
         type=str,
         default=None,
         help="pretrained VAE model for latent diffusion",
     )
+    parser.add_argument("--cond_key", type=str, help="key of metadata dict for conditioning")
+    parser.add_argument("--cond_labels", nargs='+', help="list of labels for conditioning")
+    parser.add_argument("--cond_dropout", type=float, default=0.0, help="conditional drop-out probability")
+    parser.add_argument("--uncond", action='store_true', help="override conditioning (for CFG fine-tuning)")
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
